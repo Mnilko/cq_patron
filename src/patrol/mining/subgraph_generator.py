@@ -26,12 +26,17 @@ class SubgraphGenerator:
         self._batch_size = batch_size
         self.timeout = timeout
     
-    async def generate_block_numbers(self, target_block: int, upper_block_limit: int, lower_block_limit: int = Constants.LOWER_BLOCK_LIMIT) -> List[int]:
+    async def generate_block_numbers(self, target_block: int, upper_block_limit: int = Constants.UPPER_BLOCK_LIMIT, lower_block_limit: int = Constants.LOWER_BLOCK_LIMIT) -> List[int]:
 
         bt.logging.info(f"Generating block numbers for target block: {target_block}")
+        if upper_block_limit is None:
+            upper_block_limit = 60000000
+        bt.logging.info(f"Upper block limit: {upper_block_limit}. Lower block limit: {lower_block_limit}.")
 
         start_block = max(target_block - self._max_past_events, lower_block_limit)
         end_block = min(target_block + self._max_future_events, upper_block_limit)
+
+        bt.logging.info(f"Start block: {start_block}, End block: {end_block}")
 
         return list(range(start_block, end_block + 1))
 
@@ -134,8 +139,10 @@ class SubgraphGenerator:
         return GraphPayload(nodes=nodes, edges=edges)
 
 
-    async def run(self, target_address:str, target_block:int, max_block_number: int):
+    async def run(self, target_address:str, target_block:int, max_block_number: int = Constants.UPPER_BLOCK_LIMIT):
 
+        if max_block_number is None:
+            max_block_number = 60000000
         block_numbers = await self.generate_block_numbers(target_block, upper_block_limit=max_block_number)
 
         events = await self.event_fetcher.fetch_all_events(block_numbers)

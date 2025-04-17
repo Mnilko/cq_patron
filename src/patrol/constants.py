@@ -5,5 +5,6 @@ class Constants:
     STEEPNESS = 0.005 
     U64_MAX = 2**64 - 1
     LOWER_BLOCK_LIMIT: int = 3014341
+    UPPER_BLOCK_LIMIT: int = 60000000
     MAX_RESPONSE_TIME: int = 12
 
