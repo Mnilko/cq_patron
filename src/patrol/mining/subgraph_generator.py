@@ -145,7 +145,7 @@ class SubgraphGenerator:
             max_block_number = 60000000
         block_numbers = await self.generate_block_numbers(target_block, upper_block_limit=max_block_number)
 
-        events = await self.event_fetcher.fetch_all_events(block_numbers)
+        events = await self.event_fetcher.fetch_all_events(block_numbers, batch_size=self._batch_size)
 
         processed_events = await self.event_processor.process_event_data(events)
 
