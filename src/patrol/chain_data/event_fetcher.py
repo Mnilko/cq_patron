@@ -2,16 +2,25 @@ import asyncio
 import logging
 import time
 from typing import Dict, List, Tuple, Any
+from pymongo import MongoClient
+from dotenv import load_dotenv
+import os
 
 from async_substrate_interface import AsyncSubstrateInterface
 from patrol.chain_data.runtime_groupings import group_blocks
 
 logger = logging.getLogger(__name__)
+load_dotenv()
 
 class EventFetcher:
     def __init__(self, substrate_client):
         self.substrate_client = substrate_client
         self.semaphore = asyncio.Semaphore(1)
+               # Connect to MongoDB
+        mongo_url = os.getenv("MONGO_URL", "mongodb://localhost:27017/")
+        client = MongoClient(mongo_url)  # Update with your connection string if needed
+        db = client.get_database('blockchainData')  # Update with your database name
+        self.blocks_collection = db.get_collection('blocks')  # Update with your collection name
   
     async def get_current_block(self) -> int:
         current_block = await self.substrate_client.query("get_block", None)
@@ -92,12 +101,57 @@ class EventFetcher:
 
         async with self.semaphore:
             logging.info(f"Attempting to fetch event data for {len(block_numbers)} blocks...")
+            # Log the range of blocks being fetched
+            min_block = min(block_numbers)
+            max_block = max(block_numbers)
+            logging.info(f"Fetching events for blocks in range {min_block} to {max_block}")
 
+            start_time_hashes_api = time.time()
             block_hash_tasks = [
                 self.substrate_client.query("get_block_hash", None, n)
                 for n in block_numbers
             ]
             block_hashes = await asyncio.gather(*block_hash_tasks)
+            logging.info(f"Fetched {len(block_hashes)} block hashes from API in {time.time() - start_time_hashes_api:.2f} seconds.")
+            # Get block hashes for all block numbers
+
+            # Fetch block hashes from MongoDB
+            # Query MongoDB for blocks in the range
+            start_time_hashes = time.time()
+            block_hash_docs = list(self.blocks_collection.find(
+                {'_id': {'$gte': min_block, '$lte': max_block}},
+                {'_id': 1, 'hash': 1}
+            ))
+            logging.info(f"Fetched {len(block_hash_docs)} block hashes from MongoDB in {time.time() - start_time_hashes:.2f} seconds.")
+
+            # Create mapping of block numbers to hashes
+            block_hash_mapping = {doc['_id']: doc['hash'] for doc in block_hash_docs}
+
+            # Get hashes for requested blocks, or fetch them if missing
+            block_hashes = []
+            block_numbers_to_fetch = []
+            block_info = []
+
+            for block_num in block_numbers:
+                if block_num in block_hash_mapping:
+                    hash_value = block_hash_mapping[block_num]
+                    block_hashes.append(hash_value)
+                    block_info.append((block_num, hash_value))
+                else:
+                    block_numbers_to_fetch.append(block_num)
+
+            # Fetch any missing block hashes from the chain
+            if block_numbers_to_fetch:
+                logger.info(f"Fetching {len(block_numbers_to_fetch)} missing block hashes from the chain")
+                block_hash_tasks = [
+                    self.substrate_client.query("get_block_hash", None, n)
+                    for n in block_numbers_to_fetch
+                ]
+                missing_hashes = await asyncio.gather(*block_hash_tasks)
+                
+                for block_num, hash_value in zip(block_numbers_to_fetch, missing_hashes):
+                    block_hashes.append(hash_value)
+                    block_info.append((block_num, hash_value))
 
             current_block = await self.get_current_block()
 
@@ -105,6 +159,7 @@ class EventFetcher:
             grouped = group_blocks(block_numbers, block_hashes, current_block, versions, batch_size)
 
             all_events: Dict[int, Any] = {}
+            start_time_fetchEvents = time.time()
             for runtime_version, batches in grouped.items():
                 for batch in batches:
                     logger.info(f"Fetching events for runtime version {runtime_version} (batch of {len(batch)} blocks)...")
@@ -117,6 +172,7 @@ class EventFetcher:
                         logger.warning(
                             f"Unable to fetch events for runtime version {runtime_version} batch on final attempt: {e}. Continuing..."
                         )
+            logger.info(f"Fetched events for all blocks in {time.time() - start_time_fetchEvents:.2f} seconds.")
         # Continue to next version even if the current one fails.
         logger.info(f"All events collected in {time.time() - start_time} seconds.")
         return all_events

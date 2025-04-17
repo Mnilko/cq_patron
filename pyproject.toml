@@ -13,6 +13,8 @@ dependencies = [
     "asyncpg",
     "alembic",
     "python-json-logger",
+    "pymongo",
+    "python-dotenv"
 ]
 
 [project.optional-dependencies]

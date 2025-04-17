@@ -4,6 +4,7 @@ import uuid
 import time
 from dataclasses import asdict
 import json
+import os
 from datetime import datetime
 
 from patrol.chain_data.event_fetcher import EventFetcher
@@ -15,7 +16,9 @@ from patrol.validation.miner_scoring import MinerScoring
 from patrol.validation.validator import Validator
 from patrol.chain_data.substrate_client import SubstrateClient
 from patrol.chain_data.runtime_groupings import load_versions
+from dotenv import load_dotenv
 
+load_dotenv()
 class MockMinerScoreRepo:
 
     def __init__(self):
@@ -43,9 +46,9 @@ class CustomEncoder(json.JSONEncoder):
 async def test_miner(requests):
 
     bt.debug()
+    network_url = os.getenv("DEV_NODE", "wss://archive.chain.opentensor.ai:443/")
+    print(f"Using network URL: {network_url}")
 
-    network_url = "wss://archive.chain.opentensor.ai:443/"
-        
     # Create an instance of SubstrateClient.
     versions = load_versions()
         
@@ -103,7 +106,6 @@ async def test_miner(requests):
 if __name__ == "__main__":
 
     bt.debug()
-
-    REQUESTS = 10
+    REQUESTS = 1
 
     asyncio.run(test_miner(REQUESTS))
