@@ -1,4 +1,6 @@
 import logging
+from collections import deque
+from typing import Tuple, Iterable, Deque
 from typing import Dict, Any, List
 import asyncio
 import time
@@ -6,7 +8,8 @@ import json
 
 from patrol import constants
 from patrol.protocol import GraphPayload, Edge, Node, StakeEvidence, TransferEvidence
-from patrol.validation.graph_validation.errors import PayloadValidationError, ErrorPayload, SingleNodeResponse
+from patrol.validation.scoring import ValidationResult
+from patrol.validation.graph_validation.errors import PayloadValidationError, SingleNodeResponse
 from patrol.chain_data.event_fetcher import EventFetcher
 from patrol.chain_data.event_processor import EventProcessor
 
@@ -14,19 +17,21 @@ logger = logging.getLogger(__name__)
 
 class BittensorValidationMechanism:
 
-    def __init__(self,  event_fetcher: EventFetcher, event_processer: EventProcessor):
+    def __init__(self,  event_fetcher: EventFetcher, event_processor: EventProcessor, buffer_size: int = 500):
         self.event_fetcher = event_fetcher
-        self.event_processer = event_processer
+        self.event_processor = event_processor
+        self.buffer_size = buffer_size
 
-    async def validate_payload(self, uid: int, payload: Dict[str, Any] = None, target: str = None, max_block_number: int = None) -> ErrorPayload | GraphPayload:
+    async def validate_payload(self, uid: int, payload: Dict[str, Any] = None, target: str = None, max_block_number: int = None) -> ValidationResult:
         start_time = time.time()
         logger.info(f"Starting validation process for uid: {uid}")
 
         if not payload:
-            return ErrorPayload(message="Error: Empty/Null Payload received.")
+            return ValidationResult(validated=False, message="Empty/Null Payload received.", volume=0)
 
         try:
             graph_payload = self._parse_graph_payload(payload)
+            volume = len(graph_payload.nodes) + len(graph_payload.edges)
             self._verify_target_in_graph(target, graph_payload)
             self._verify_graph_connected(graph_payload)
 
@@ -34,16 +39,16 @@ class BittensorValidationMechanism:
 
         except SingleNodeResponse as e:
             logger.info(f"Validation skipped for uid {uid}: {e}")
-            return ErrorPayload(message=f"Error: {str(e)}")
+            return ValidationResult(validated=False, message=f"Validation skipped for uid {uid}: {e}", volume=volume)
 
         except Exception as e: 
             logger.info(f"Validation error for uid {uid}: {e}")
-            return ErrorPayload(message=f"Error: {str(e)}")
+            return ValidationResult(validated=False, message=f"Validation error for uid {uid}: {e}", volume=volume)
 
         validation_time = time.time() - start_time
         logger.info(f"Validation finished for {uid}. Completed in {validation_time:.2f} seconds")
 
-        return graph_payload
+        return ValidationResult(validated=True, message="Validation Passed", volume=volume)
 
     def _parse_graph_payload(self, payload: dict) -> GraphPayload:
         """
@@ -190,26 +195,11 @@ class BittensorValidationMechanism:
                 f"Found {len(invalid_blocks)} invalid block(s) outside the allowed range "
                 f"[{min_block}, {max_block_number}]: {invalid_blocks}"
             )
-
-    async def _verify_edge_data(self, graph_payload: GraphPayload, max_block_number: int):
-
-        block_numbers = []
-
-        for edge in graph_payload.edges:
-            block_numbers.append(edge.evidence.block_number)
-        
-        await self._verify_block_ranges(block_numbers, max_block_number)
-
-        events = await self.event_fetcher.fetch_all_events(block_numbers)
-
-        processed_events = await self.event_processer.process_event_data(events)
-
-        validation_block_numbers = []
-
-        event_keys = set()
-        for event in processed_events:
+    
+    @staticmethod
+    def _make_event_key(event: dict) -> Tuple:
             evidence = event.get('evidence', {})
-            event_key = json.dumps({
+            event_dict = {
                 "coldkey_source": event.get("coldkey_source"),
                 "coldkey_destination": event.get("coldkey_destination"),
                 "coldkey_owner": event.get("coldkey_owner"),
@@ -222,38 +212,89 @@ class BittensorValidationMechanism:
                 "alpha_amount": evidence.get("alpha_amount"),
                 "delegate_hotkey_source": evidence.get("delegate_hotkey_source"),
                 "delegate_hotkey_destination": evidence.get("delegate_hotkey_destination"),
-            }, sort_keys=True)
-            validation_block_numbers.append(evidence.get("block_number"))
-            event_keys.add(event_key)
+            }
+            return tuple(sorted(event_dict.items())), evidence.get("block_number")
+
+    async def _fetch_event_keys(self, block_numbers: Iterable[int]) -> Tuple[set[Tuple], set[int]]:
+        event_keys = set()
+        validation_block_numbers = set()
+        queue = asyncio.Queue()
+
+        async def process_buffered_events(buffer: Deque[Tuple[int, Any]]) -> None:
+            if not buffer:
+                return
+            to_process = dict(buffer)
+            processed_batch = await self.event_processor.process_event_data(to_process)
+            logger.info(f"Received and processed {len(processed_batch)} events.")
+            for event in processed_batch:
+                key, block_number = self._make_event_key(event)
+                event_keys.add(key)
+                validation_block_numbers.add(block_number)
+
+        async def consumer_event_queue() -> None:
+            buffer: Deque[Tuple[int, Any]] = deque()
+
+            while True:
+                events = await queue.get()
+                if events is None:
+                    break
+
+                buffer.extend(events.items())
+                while len(buffer) >= self.buffer_size:
+                    temp_buffer = deque(buffer.popleft() for _ in range(self.buffer_size))
+                    await process_buffered_events(temp_buffer)
+
+            await process_buffered_events(buffer)
+
+        producer_task = asyncio.create_task(self.event_fetcher.stream_all_events(block_numbers, queue, batch_size=25))
+        consumer_task = asyncio.create_task(consumer_event_queue())
+
+        await asyncio.gather(producer_task, consumer_task)
+        return event_keys, validation_block_numbers
+
+    async def _verify_edge_data(self, graph_payload: GraphPayload, max_block_number: int):
+
+        block_numbers = {edge.evidence.block_number for edge in graph_payload.edges}
+        
+        await self._verify_block_ranges(block_numbers, max_block_number)
+
+        event_keys, validation_block_numbers = await self._fetch_event_keys(block_numbers) 
 
         # Check each graph edge against processed chain events
-        missing_edges = []
+        missing_edges = 0
         for edge in graph_payload.edges:
-            ev = vars(edge.evidence)
-            edge_key = json.dumps({
+            evidence_fields = [
+                "rao_amount",
+                "block_number",
+                "destination_net_uid",
+                "source_net_uid",
+                "alpha_amount",
+                "delegate_hotkey_source",
+                "delegate_hotkey_destination"
+            ]
+
+            edge_dict = {
                 "coldkey_source": edge.coldkey_source,
                 "coldkey_destination": edge.coldkey_destination,
                 "coldkey_owner": edge.coldkey_owner,
                 "category": edge.category,
                 "type": edge.type,
-                "rao_amount": ev.get("rao_amount"),
-                "block_number": ev.get("block_number"),
-                "destination_net_uid": ev.get("destination_net_uid"),
-                "source_net_uid": ev.get("source_net_uid"),
-                "alpha_amount": ev.get("alpha_amount"),
-                "delegate_hotkey_source": ev.get("delegate_hotkey_source"),
-                "delegate_hotkey_destination": ev.get("delegate_hotkey_destination"),
-            }, sort_keys=True)
+                **{
+                    field: getattr(edge.evidence, field, None)
+                    for field in evidence_fields
+                }
+            }
+
+            edge_key = tuple(sorted(edge_dict.items()))
 
             if edge_key not in event_keys:
-                block_number = ev.get("block_number")
-                if block_number not in validation_block_numbers:
+                if edge.evidence.block_number not in validation_block_numbers:
                     continue  # Skip this edge; block was never fetched
                 else:
-                    missing_edges.append(edge_key)  # Block was fetched, but the edge did not match any event
+                    missing_edges += 1  # Block was fetched, but the edge did not match any event
 
-        if missing_edges:
-            raise PayloadValidationError(f"{len(missing_edges)} edges not found in on-chain events.")
+        if missing_edges != 0:
+            raise PayloadValidationError(f"{missing_edges} edges not found in on-chain events.")
 
         logger.debug("All edges matched with on-chain events.")
 
@@ -280,12 +321,12 @@ if __name__ == "__main__":
 
         validator = BittensorValidationMechanism(fetcher, event_processor)
 
-        file_path = "subgraph_output.json"
+        file_path = "subgraph_output_3.json"
         with open(file_path, "r") as f:
             payload = json.load(f)
 
-        # Run the validation
-        result = await validator.validate_payload(uid=1, payload=payload, target="5FyCncAf9EBU8Nkcm5gL1DQu3hVmY7aphiqRn3CxwoTmB1cZ", max_block_number=148469638)
-            # bt.logging.info("Validated Payload:", result)
+        tasks = [validator.validate_payload(uid=1, payload=payload, target="5Ck5g3MaG7Ho29ZqmcTFgq8zTxmnrwxs6FR94RsCEquT6nLy", max_block_number=5352419) for _ in range(8)]
+
+        await asyncio.gather(*tasks)
 
     asyncio.run(main())

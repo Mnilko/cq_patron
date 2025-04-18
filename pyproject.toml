@@ -15,6 +15,7 @@ dependencies = [
     "python-json-logger",
     "pymongo",
     "python-dotenv"
+    "async_lru"
 ]
 
 [project.optional-dependencies]

@@ -5,20 +5,19 @@ import uuid
 from datetime import datetime, UTC
 from uuid import UUID
 
-from patrol.protocol import GraphPayload
-from patrol.validation.graph_validation.errors import ErrorPayload
-from patrol.validation.scoring import MinerScore, MinerScoreRepository
+from patrol.validation.scoring import MinerScore, MinerScoreRepository, ValidationResult
 from patrol.constants import Constants
 
 logger = logging.getLogger(__name__)
 
 class MinerScoring:
-    def __init__(self, miner_score_repository: MinerScoreRepository):
+    def __init__(self, miner_score_repository: MinerScoreRepository, moving_average_denominator: int = 20):
         self.importance = {
             'volume': 0.9,
             'responsiveness': 0.1,
         }
         self.miner_score_repository = miner_score_repository
+        self.moving_average_denominator = moving_average_denominator
 
     def calculate_novelty_score(self, payload: Dict[str, Any]) -> float:
         # Placeholder for future implementation
@@ -37,16 +36,15 @@ class MinerScoring:
         uid: int,
         coldkey: str,
         hotkey: str,
-        payload: GraphPayload | ErrorPayload,
+        validation_result: ValidationResult,
         response_time: float,
         batch_id: UUID,
-        moving_average_denominator: int = 20
     ) -> MinerScore:
 
-        previous_overall_scores = await self.miner_score_repository.find_latest_overall_scores((hotkey, uid), moving_average_denominator - 1)
+        previous_overall_scores = await self.miner_score_repository.find_latest_overall_scores((hotkey, uid), self.moving_average_denominator - 1)
 
-        if isinstance(payload, ErrorPayload):
-            logger.warning(f"Zero score added to records for {uid}, reason: {payload.message}.")
+        if not validation_result.validated:
+            logger.warning(f"Zero score added to records for {uid}, reason: {validation_result.message}.")
             return MinerScore(
                 id=uuid.uuid4(),
                 batch_id=batch_id,
@@ -54,19 +52,18 @@ class MinerScoring:
                 uid=uid,
                 coldkey=coldkey,
                 hotkey=hotkey,
-                overall_score_moving_average=(sum(previous_overall_scores) + 0.0) / moving_average_denominator,
+                overall_score_moving_average=(sum(previous_overall_scores) + 0.0) / self.moving_average_denominator,
                 overall_score=0.0,
                 volume_score=0.0,
-                volume=0,
+                volume=validation_result.volume,
                 responsiveness_score=0.0,
                 response_time_seconds=response_time,
                 novelty_score=None,
                 validation_passed=False,
-                error_message=payload.message
+                error_message=validation_result.message
             )
 
-        volume = len(payload.nodes) + len(payload.edges)
-        volume_score = self.calculate_volume_score(volume)
+        volume_score = self.calculate_volume_score(validation_result.volume)
         responsiveness_score = self.calculate_responsiveness_score(response_time)
 
         overall_score = sum([
@@ -83,10 +80,10 @@ class MinerScoring:
             uid=uid,
             coldkey=coldkey,
             hotkey=hotkey,
-            overall_score_moving_average=(sum(previous_overall_scores) + overall_score) / moving_average_denominator,
+            overall_score_moving_average=(sum(previous_overall_scores) + overall_score) / self.moving_average_denominator,
             overall_score=overall_score,
             volume_score=volume_score,
-            volume=volume,
+            volume=validation_result.volume,
             responsiveness_score=responsiveness_score,
             response_time_seconds=response_time,
             novelty_score=None,
@@ -94,12 +91,9 @@ class MinerScoring:
             error_message=None
         )
 
-    async def calculate_zero_score(
-            self, batch_id, uid, coldkey, hotkey, error_message,
-            moving_average_denominator: int = 20
-    ):
+    async def calculate_zero_score(self, batch_id, uid, coldkey, hotkey, error_message):
         previous_overall_scores = await self.miner_score_repository.find_latest_overall_scores(
-            (hotkey, uid), moving_average_denominator - 1
+            (hotkey, uid), self.moving_average_denominator - 1
         )
 
         return MinerScore(
@@ -109,7 +103,7 @@ class MinerScoring:
             uid=uid,
             coldkey=coldkey,
             hotkey=hotkey,
-            overall_score_moving_average=(sum(previous_overall_scores) + 0) / moving_average_denominator,
+            overall_score_moving_average=(sum(previous_overall_scores) + 0) / self.moving_average_denominator,
             overall_score=0,
             volume_score=0,
             volume=0,

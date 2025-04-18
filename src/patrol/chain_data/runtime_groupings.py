@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -60,8 +60,9 @@ def group_blocks(
     block_hashes: List[str],
     current_block: int,
     versions: VersionData,
-    batch_size: int = 25
-) -> Dict[int, List[List[int]]]:
+    batch_size: int = 25,
+    min_batch_size: int = 10
+) -> Dict[int, List[List[Tuple[int, str]]]]:
     """
     Groups blocks by version and splits each group into batches.
 
@@ -82,11 +83,17 @@ def group_blocks(
         else:
             logger.warning(f"Block {block_number} is outside current groupings.")
 
-    batched: Dict[int, List[List[int]]] = {}
+    batched: Dict[int, List[List[Tuple[int, str]]]] = {}
     for group_id, block_list in grouped.items():
-        batched[group_id] = [
+        batches: List[List[Tuple[int, str]]] = [
             block_list[i:i + batch_size] for i in range(0, len(block_list), batch_size)
         ]
+
+        # Merge the final batch if it's too small
+        if len(batches) > 1 and len(batches[-1]) < min_batch_size:
+            batches[-2].extend(batches.pop())  # Merge last into second-last
+
+        batched[group_id] = batches
 
     return batched
 

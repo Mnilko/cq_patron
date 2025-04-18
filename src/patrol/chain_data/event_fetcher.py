@@ -1,10 +1,10 @@
 import asyncio
 import logging
 import time
-from typing import Dict, List, Tuple, Any
 from pymongo import MongoClient
 from dotenv import load_dotenv
 import os
+from typing import Dict, Iterable, List, Tuple, Any
 
 from async_substrate_interface import AsyncSubstrateInterface
 from patrol.chain_data.runtime_groupings import group_blocks
@@ -15,8 +15,8 @@ load_dotenv()
 class EventFetcher:
     def __init__(self, substrate_client):
         self.substrate_client = substrate_client
-        self.semaphore = asyncio.Semaphore(1)
-               # Connect to MongoDB
+        self.hash_semaphore = asyncio.Semaphore(20)
+        self.event_semaphore = asyncio.Semaphore(1)
         mongo_url = os.getenv("MONGO_URL", "mongodb://localhost:27017/")
         client = MongoClient(mongo_url)  # Update with your connection string if needed
         db = client.get_database('blockchainData')  # Update with your database name
@@ -99,9 +99,8 @@ class EventFetcher:
 
         block_numbers = set(block_numbers)
 
-        async with self.semaphore:
-            logging.info(f"Attempting to fetch event data for {len(block_numbers)} blocks...")
-            # Log the range of blocks being fetched
+        async with self.event_semaphore:
+            logger.info(f"Attempting to fetch event data for {len(block_numbers)} blocks...")
             min_block = min(block_numbers)
             max_block = max(block_numbers)
             logging.info(f"Fetching events for blocks in range {min_block} to {max_block}")
@@ -177,9 +176,68 @@ class EventFetcher:
         logger.info(f"All events collected in {time.time() - start_time} seconds.")
         return all_events
 
-async def example():
+    async def stream_all_events(
+        self,
+        block_numbers: Iterable[int],
+        queue: asyncio.Queue,
+        batch_size: int = 25,
+    ) -> None:
+        """
+        Streams events into a queue. Each batch of events is put into the queue as it's fetched.
+        """
+        if not block_numbers:
+            logger.warning("No block numbers provided. Nothing to yield.")
+            await queue.put(None)
+            return
 
-    import json
+        if any(not isinstance(b, int) for b in block_numbers):
+            logger.warning("Non-integer value found in block_numbers. Nothing to yield.")
+            await queue.put(None)
+            return
+
+        block_numbers = set(block_numbers)
+        logger.info(f"Attempting to stream event data for {len(block_numbers)} blocks...")
+
+        async def safe_get_block_hash(n: int) -> str | None:
+            try:
+                async with self.hash_semaphore:
+                    return await self.substrate_client.query("get_block_hash", None, n)
+            except Exception as e:
+                logger.warning(f"Failed to retrieve block hash for block {n}: {e}")
+                return None
+
+        block_hashes = await asyncio.gather(*[safe_get_block_hash(n) for n in block_numbers])
+        current_block = await self.get_current_block()
+        versions = self.substrate_client.return_runtime_versions()
+        grouped = group_blocks(block_numbers, block_hashes, current_block, versions, batch_size)
+
+        async def fetch_and_return_events(runtime_version, batch, timeout=2):
+            async with self.event_semaphore:
+                try:
+                    logger.debug(f"Fetching events for runtime version {runtime_version} (batch of {len(batch)} blocks)...")
+                    events = await asyncio.wait_for(
+                        self.get_block_events(runtime_version, batch),
+                        timeout=timeout
+                    )
+                    logger.debug(f"Yielding {len(events)} events from batch.")
+                    if events is not None:
+                        await queue.put(events)
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout while fetching events for runtime version {runtime_version}, batch of size {len(batch)}")
+                except Exception as e:
+                    logger.warning(f"Skipping failed batch due to error: {e}")
+
+        # Launch all batch tasks
+        tasks = [
+            fetch_and_return_events(runtime_version, batch)
+            for runtime_version, batches in grouped.items()
+            for batch in batches
+        ]
+        await asyncio.gather(*tasks)
+
+        await queue.put(None)
+            
+async def example():
 
     from patrol.chain_data.substrate_client import SubstrateClient
     from patrol.chain_data.runtime_groupings import load_versions
@@ -193,8 +251,9 @@ async def example():
     fetcher = EventFetcher(substrate_client=client)
 
     test_cases = [
-        [5163655 + i for i in range(1000)],
-        # [3804341 + i for i in range(1000)]    # high volume
+        [3014340 + i for i in range(10000)],
+        [5255099 + i for i in range(10000)],
+        [3804341 + i for i in range(10000)]    # high volume
     ]
 
     for test_case in test_cases:
@@ -202,14 +261,9 @@ async def example():
         logger.info("Starting next test case.")
 
         start_time = time.time()
-        all_events = await fetcher.fetch_all_events(test_case, 50)
-        logger.info(f"\nRetrieved events for {len(all_events)} blocks in {time.time() - start_time:.2f} seconds.")
+        all_events = await fetcher.fetch_all_events(test_case, 100)
 
-        with open('raw_event_data.json', 'w') as file:
-            json.dump(all_events, file, indent=4)
-
-        # bt.logging.debug(all_events)
-
+        print(f"Retrieved events for {len(all_events)} blocks in {time.time() - start_time:.2f} seconds.")
 
 if __name__ == "__main__":
     asyncio.run(example())

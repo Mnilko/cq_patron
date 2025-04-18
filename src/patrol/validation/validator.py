@@ -87,10 +87,10 @@ class Validator:
                 payload_subgraph = json_response['subgraph_output']
                 logger.info(f"Payload received for UID %s in %s seconds.", uid, response_time)
 
-                validation_results = await self.validation_mechanism.validate_payload(uid, payload_subgraph, target=target_tuple[0], max_block_number=max_block_number)
+                validation_result = await self.validation_mechanism.validate_payload(uid, payload_subgraph, target=target_tuple[0], max_block_number=max_block_number)
                 logger.info(f"Calculating score for miner %s", uid)
                 miner_score = await self.scoring_mechanism.calculate_score(
-                    uid, axon_info.coldkey, axon_info.hotkey, validation_results, response_time, batch_id
+                    uid, axon_info.coldkey, axon_info.hotkey, validation_result, response_time, batch_id
                 )
         except Exception as ex:
             if isinstance(ex, aiohttp.ClientConnectorError):
@@ -142,7 +142,7 @@ class Validator:
             ) as response:
                 buffer = bytearray()
                 if response.ok:
-                    async for chunk in response.content.iter_chunked(8092):
+                    async for chunk in response.content.iter_chunked(8*1024):
                         buffer.extend(chunk)
                         if len(buffer) > self.max_response_size_bytes:
                             raise ResponsePayloadTooLarge(f"Response payload too large: Aborted at {len(buffer)} bytes")
@@ -226,7 +226,7 @@ async def start():
     miner_validator = Validator(
         validation_mechanism=BittensorValidationMechanism(event_fetcher, event_processor),
         target_generator=TargetGenerator(event_fetcher, event_processor),
-        scoring_mechanism=MinerScoring(miner_score_repository),
+        scoring_mechanism=MinerScoring(miner_score_repository, moving_average_denominator=8),
         miner_score_repository=miner_score_repository,
         dendrite=dendrite,
         metagraph=metagraph,
@@ -238,14 +238,16 @@ async def start():
     )
 
 
+    #await asyncio.wait_for(miner_validator.query_miner_batch(), timeout=60*60)
+    
     update_available = False
     while not update_available:
         try:
             update_available = ENABLE_AUTO_UPDATE and await auto_update.is_update_available()
             if update_available:
                 break
-            await miner_validator.query_miner_batch()
 
+            await miner_validator.query_miner_batch()
         except Exception as ex:
             logger.exception("Error!")
 
