@@ -105,13 +105,13 @@ class EventFetcher:
             max_block = max(block_numbers)
             logging.info(f"Fetching events for blocks in range {min_block} to {max_block}")
 
-            start_time_hashes_api = time.time()
-            block_hash_tasks = [
-                self.substrate_client.query("get_block_hash", None, n)
-                for n in block_numbers
-            ]
-            block_hashes = await asyncio.gather(*block_hash_tasks)
-            logging.info(f"Fetched {len(block_hashes)} block hashes from API in {time.time() - start_time_hashes_api:.2f} seconds.")
+            # start_time_hashes_api = time.time()
+            # block_hash_tasks = [
+            #     self.substrate_client.query("get_block_hash", None, n)
+            #     for n in block_numbers
+            # ]
+            # block_hashes = await asyncio.gather(*block_hash_tasks)
+            # logging.info(f"Fetched {len(block_hashes)} block hashes from API in {time.time() - start_time_hashes_api:.2f} seconds.")
             # Get block hashes for all block numbers
 
             # Fetch block hashes from MongoDB
